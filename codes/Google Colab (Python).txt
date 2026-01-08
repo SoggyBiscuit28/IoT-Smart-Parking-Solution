@@ -1,0 +1,258 @@
+Google Colab (Python)
+
+!pip3 install requests-toolbelt
+!pip3 install pyrebase4
+
+
+#!/usr/bin/env python3
+"""
+wallet_manager.py
+──────────────────────────────────────────────────────────────
+Live‑wallet service for the Smart‑Parking prototype.
+
+▸ Listens to /commands/esp32
+▸ For every {action:"entry", id:"testX"}   → starts  ₹0.10/s deduction
+▸ For every {action:"exit",  id:"testX"}   → stops   deduction
+▸ Balances live under /users/{id}/wallet/balance
+"""
+
+booked_dict = {}
+
+
+import threading, time, sys, signal
+import pyrebase
+from decimal import Decimal, ROUND_HALF_UP
+
+
+# ─── CONFIG – change if you like ──────────────────────────────────────────────
+DB_URL      = "https://smart-parking-testing-874a2-default-rtdb.asia-southeast1.firebasedatabase.app/"
+DB_API_KEY  = "AIzaSyCAaehjdrBkuXuvp1DZZhd32YV3RzAShy8"
+
+TEST_IDS        = [f"test{i}" for i in range(1, 7)]   # test1 … test6
+START_BALANCE   = Decimal("100.00")                   # ₹ pre‑load amount
+ROUND_2_DP      = lambda d: d.quantize(Decimal("0.01"), ROUND_HALF_UP)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+firebase = pyrebase.initialize_app({
+    "apiKey":            DB_API_KEY,
+    "databaseURL":       DB_URL,
+    "authDomain":        "",          # not used
+    "storageBucket":     "",          # not used
+})
+
+db = firebase.database()
+_running   = {}          # id -> threading.Event()
+_threads   = {}
+
+
+def _deduct_loop(id_: str, stop_event: threading.Event, rps :Decimal):
+    """Runs in a background thread, deducting RATE_PER_SEC every second."""
+    path = f"users/{id_}/wallet/balance"
+    while not stop_event.is_set():
+        try:
+            print("Deducting from "+str(id_))
+            bal_raw = db.child(path).get().val() or "0"
+            bal     = Decimal(bal_raw)
+            new_bal = ROUND_2_DP(bal - rps)
+            db.child(path).set(str(new_bal))
+        except Exception as e:
+            print(f"[{id_}] Write failed: {e}", file=sys.stderr)
+        time.sleep(1)
+
+
+# --- REWRITTEN _start_meter (Handles ENTRY logic) ---
+def _start_meter(id_: str):
+    if id_ in _running:
+        print(f"[{id_:>6}] WARNING: _start_meter called while meter already running. Stopping existing first.", file=sys.stderr)
+        _stop_meter(id_)
+
+    rate_booked = Decimal("0.10")
+    rate_unbooked = Decimal("0.20")
+
+    # Get slot from Firebase where user parked
+    while(True):
+        parked_slot = db.child(f"users/{id_}/place").get().val()
+        if parked_slot:
+            break
+        print(f"[{id_:>6}] Waiting for slot to be set in Firebase...")
+        time.sleep(1)
+    print(f"[{id_:>6}] Slot {parked_slot} found in Firebase.")
+    # Get booked slots from Firebase
+
+    user_has_booking = False
+    booked_slot = None
+    wrong_slot = False
+    slot_taken = False
+
+    # Check if user has a booking
+    for slot, booked_id in list(booked_dict.items()):
+        if booked_id == id_:
+            user_has_booking = True
+            booked_slot = slot
+            if parked_slot != booked_slot:
+                wrong_slot = True
+            break
+
+    # Check if parking in someone else's booked slot
+    for slot, booked_id in booked_dict.items():
+        if slot == parked_slot and booked_id != id_:
+            slot_taken = True
+            break
+
+    # Apply rules
+    if slot_taken:
+        # Rule 3: Parked in someone else's booked slot
+        rate_to_use = rate_unbooked
+        print(f"[{id_:>6}] Parked in slot {parked_slot} booked by another user. Rate: {rate_to_use}/s")
+
+    elif user_has_booking:
+        if wrong_slot:
+            # Rule 1: Booked slot i but parked in j
+            print(f"[{id_:>6}] Charging penalty of ₹5 for parking in wrong slot")
+            bal_raw = db.child(f"users/{id_}/wallet/balance").get().val() or "0"
+            bal = Decimal(bal_raw)
+            new_bal = ROUND_2_DP(bal - Decimal("5.00"))
+            db.child(f"users/{id_}/wallet/balance").set(str(new_bal))
+            rate_to_use = rate_booked
+        else:
+            # Rule 2: Parked in correct booked slot
+            rate_to_use = rate_booked
+
+        print(f"[{id_:>6}] Removing booking for slot {booked_slot} upon entry")
+        del booked_dict[booked_slot]
+        print(f"Current bookings: {booked_dict}")
+
+    else:
+        # No booking, standard unbooked rate
+        rate_to_use = rate_booked
+        print(f"[{id_:>6}] No booking found. Rate: {rate_to_use}/s")
+
+    print(f"[{id_:>6}] ▲ Starting ENTRY billing (rate: {rate_to_use}/s)")
+    stop_evt = threading.Event()
+    t = threading.Thread(target=_deduct_loop, args=(id_, stop_evt, rate_to_use), daemon=True, name=f"meter-entry-{id_}")
+    _running[id_] = stop_evt
+    _threads[id_] = t
+    t.start()
+
+def _stop_meter(id_: str):
+    """Signals the deduction thread for id_ to stop and waits for it."""
+    stop_evt = _running.pop(id_, None)
+    t        = _threads.pop(id_, None)
+    if stop_evt:
+        thread_name = t.name if t else f"meter-{id_}" # Get name if thread object exists
+        print(f"[{id_:>6}] Signaling stop for thread {thread_name}...")
+        stop_evt.set() # Signal the thread to stop
+        if t:
+            print(f"[{id_:>6}] Waiting for thread {thread_name} to join...")
+            t.join(timeout=5.0) # Wait for thread to finish (max 5 seconds)
+            if t.is_alive():
+                print(f"[{id_:>6}] ■ WARNING: Thread {thread_name} did not stop gracefully after 5s.", file=sys.stderr)
+            else:
+                print(f"[{id_:>6}] ■ Thread {thread_name} joined. Stopped billing.")
+        else:
+             print(f"[{id_:>6}] ■ Stop event found and signaled, but thread object missing for {thread_name}.")
+    else:
+        # This is not an error if we try to stop a non-existent meter (e.g., cancelling without booking)
+        print(f"[{id_:>6}] ■ No active meter found in _running to stop for ID {id_}.")
+
+# --- Modified _stream_handler ---
+def _stream_handler(msg):
+    """Handles commands from the Firebase stream."""
+    if not isinstance(msg["data"], dict):
+        print(f"Ignoring non-dict data: {msg['data']}", file=sys.stderr)
+        return
+
+    action = msg["data"].get("action")
+    pid    = msg["data"].get("id")
+    slot   = msg["data"].get("slot")
+
+    print(f"Received command: action={action}, id={pid}, slot={slot}, data={msg['data']}") # Debug
+
+    if not action:
+        print("Ignoring message with no action.", file=sys.stderr)
+        return
+
+    # --- Action Handling ---
+
+    if action == "entry":
+        print(f"[{pid:>6}] ENTRY action received.")
+        print(f"[{pid:>6}] Stopping any existing meter before entry...")
+        _stop_meter(pid)
+        _start_meter(pid)
+
+    elif action == "exit":
+        print(f"[{pid:>6}] EXIT action received.")
+        _stop_meter(pid)
+
+    elif action == "booking":
+        book_id = pid
+        book_slot = slot
+
+        print(f"[{book_id:>6}] ◆ booking slot {book_slot}...")
+        booked_dict[book_slot] = book_id
+
+        # Start the booking fee meter (0.15/s)
+        booking_rate = Decimal("0.15")
+        print(f"[{book_id:>6}] Starting BOOKING fee meter ({booking_rate}/s)")
+        stop_evt = threading.Event()
+        # Use a distinct name for booking threads
+        t = threading.Thread(target=_deduct_loop, args=(book_id, stop_evt, booking_rate), daemon=True, name=f"meter-booking-{book_id}")
+        _running[book_id] = stop_evt
+        _threads[book_id] = t
+        t.start() # <<< START THE BOOKING THREAD
+        print(f"Current bookings: {booked_dict}")
+
+    elif action == "cancelled":
+        # Use pid from message if available, fallback if necessary
+        cancel_id = pid
+
+        print(f"[{cancel_id:>6}] CANCELLED action received.")
+        # Stop the meter (likely the booking fee meter)
+        _stop_meter(cancel_id)
+
+        # Remove the booking from the dictionary
+        slot_to_remove = None
+        # Use list() to create a copy for safe iteration while potentially modifying dict
+        for slot_path, booked_id in list(booked_dict.items()):
+            if booked_id == cancel_id:
+                slot_to_remove = slot_path
+                print(f"[{cancel_id:>6}] Removing booking for slot {slot_to_remove}.")
+                del booked_dict[slot_to_remove]
+                print(f"Current bookings: {booked_dict}")
+                break # Assume user can only book one slot at a time
+        if not slot_to_remove:
+             print(f"[{cancel_id:>6}] No active booking found in booked_dict for this ID.")
+
+    else:
+        print(f"Ignoring unknown action: '{action}'", file=sys.stderr)
+
+def preload_users():
+    print("✓  Startup: balances ensured for", ", ".join(TEST_IDS))
+
+
+def graceful_exit(signum, frame):
+    print("\nStopping…")
+    for pid in list(_running.keys()):
+        _stop_meter(pid)
+    sys.exit(0)
+
+
+def main():
+    preload_users()
+    # catch Ctrl‑C cleanly
+    signal.signal(signal.SIGINT, graceful_exit)
+
+    print("⇢  Listening for commands …")
+    # keep the stream open forever (Pyrebase uses REST streaming under the hood)
+    my_stream = db.child("commands/esp32").stream(_stream_handler, stream_id="cmd")
+    try:
+        while True:
+            time.sleep(3600)     # keep main thread alive
+    finally:
+        my_stream.close()
+
+
+if __name__ == "__main__":
+    main()
+

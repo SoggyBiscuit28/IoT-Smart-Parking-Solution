@@ -1,0 +1,360 @@
+Webpage
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Smart Parking Dashboard</title>
+    <style>
+      /* Global Styles */
+      body {
+        margin: 0;
+        padding: 20px;
+        background: #f4f7f6;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        color: #333;
+      }
+      .dashboard-container {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      h1 {
+        text-align: center;
+        color: #009879;
+      }
+      p#rowData {
+        text-align: center;
+        font-size: 0.9em;
+        color: #555;
+      }
+
+      /* Legend */
+      .legend {
+        display: flex;
+        justify-content: center;
+        margin: 20px 0;
+        gap: 40px;
+        font-size: 0.9em;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      /* Table Styles (shared) */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #fff;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        margin-bottom: 26px;
+      }
+      th,
+      td {
+        padding: 12px 15px;
+        border: 1px solid #ddd;
+        text-align: center;
+      }
+      th {
+        background-color: #009879;
+        color: #fff;
+      }
+
+      /* Parking Spot Indicator */
+      .parking-spot {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        border: 2px solid #ccc;
+      }
+      .occupied {
+        background-color: #e74c3c;
+        border-color: #c0392b;
+      }
+      .vacant {
+        background-color: #2ecc71;
+        border-color: #27ae60;
+      }
+      .booked {
+        background-color: #9b59b6; /* Purple */
+        border-color: #8e44ad;
+      }
+      .unknown-occupied { /* New class for N/A ID */
+        background-color: #343a40; /* Dark grey/Black */
+        border-color: #212529;
+      }
+      .parking-wrapper {
+        display: inline-block;
+        text-align: center;
+        margin: 3px;
+      }
+      .parking-label {
+        font-size: 0.7em;
+        color: #222;
+        margin-top: 2px;
+      }
+
+      /* Responsive adjustments */
+      @media (max-width: 600px) {
+        th,
+        td {
+          padding: 8px 10px;
+          font-size: 0.9em;
+        }
+        .parking-spot {
+          width: 18px;
+          height: 18px;
+        }
+      }
+
+      /* Notification Styles */
+      .change-notification {
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 152, 121, 0.9);
+        color: white;
+        padding: 12px 24px;
+        border-radius: 25px;
+        font-size: 0.9em;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        opacity: 0;
+        visibility: hidden;
+        transition: all 0.3s ease;
+        z-index: 1000;
+      }
+      .change-notification.show {
+        opacity: 1;
+        visibility: visible;
+        bottom: 30px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard-container">
+      <h1>Smart Parking Dashboard</h1>
+      <p id="rowData">Loading data...</p>
+
+      <!-- Legend -->
+      <div class="legend">
+        <div class="legend-item">
+          <div class="parking-spot vacant"></div>
+          <span>Available</span>
+        </div>
+        <div class="legend-item">
+          <div class="parking-spot occupied"></div>
+          <span>Occupied</span>
+        </div>
+        <div class="legend-item">
+          <div class="parking-spot booked"></div>
+          <span>Booked</span>
+        </div>
+        <div class="legend-item"> <!-- New legend item -->
+          <div class="parking-spot unknown-occupied"></div>
+          <span>Occupied (Unknown ID)</span>
+        </div>
+      </div>
+
+      <!-- NEW ▸ Wallet table -->
+      <table>
+        <thead>
+          <tr>
+            <th>User ID</th>
+            <th>Balance (₹)</th>
+          </tr>
+        </thead>
+        <tbody id="walletBody">
+          <!-- Populated live -->
+        </tbody>
+      </table>
+
+      <!-- Sensor table -->
+      <table>
+        <thead>
+          <tr>
+            <th>Row ID</th>
+            <th>Parking Spots</th>
+          </tr>
+        </thead>
+        <tbody id="parkingTableBody">
+          <!-- Populated live -->
+        </tbody>
+      </table>
+    </div>
+
+    <div class="change-notification" id="changeNotification"></div>
+
+    <!-- Firebase SDK (Modular v9) -->
+    <script type="module">
+      import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.19.1/firebase-app.js';
+      import {
+        getDatabase,
+        ref,
+        onValue,
+      } from 'https://www.gstatic.com/firebasejs/9.19.1/firebase-database.js';
+
+      /* ---------- Firebase config ---------- */
+      const firebaseConfig = {
+        apiKey: 'AIzaSyCAaehjdrBkuXuvp1DZZhd32YV3RzAShy8',
+        authDomain: 'smart-parking-testing-874a2.firebaseapp.com',
+        databaseURL:
+          'https://smart-parking-testing-874a2-default-rtdb.asia-southeast1.firebasedatabase.app',
+        projectId: 'smart-parking-testing-874a2',
+        storageBucket: 'smart-parking-testing-874a2.appspot.com',
+        messagingSenderId: '773450752410',
+        appId: '1:773450752410:web:dfbbe58c4041d8be199a23',
+        measurementId: 'G-EM4PDT3HFB',
+      };
+
+      const app = initializeApp(firebaseConfig);
+      const db = getDatabase(app);
+
+      /* ---------- DB refs ---------- */
+      const rootRef = ref(db, '/');
+      const cmdRef = ref(db, 'commands/esp32');
+      const walletRef = ref(db, 'users');
+
+      /* ---------- Toast helper ---------- */
+      let lastTs = null;
+      let toastTO = null;
+      function toast(msg) {
+        const n = document.getElementById('changeNotification');
+        n.textContent = msg;
+        n.classList.remove('show'); // reset
+        void n.offsetWidth;
+        n.classList.add('show');
+        clearTimeout(toastTO);
+        toastTO = setTimeout(() => n.classList.remove('show'), 3000);
+      }
+
+      /* ---------- Command listener (pop‑up) ---------- */
+      onValue(cmdRef, (snap) => {
+        const c = snap.val();
+        if (c && c.timestamp && c.timestamp !== lastTs) {
+          const time = new Date(c.timestamp).toLocaleTimeString();
+          toast(`${c.id} ${c.action} @ ${time}`);
+          lastTs = c.timestamp;
+        }
+      });
+
+      /* ---------- Wallet listener ---------- */
+      onValue(
+        walletRef,
+        (snap) => {
+          const data = snap.val() || {};
+          const body = document.getElementById('walletBody');
+          body.innerHTML = '';
+
+          // iterate in alpha order for consistency
+          Object.keys(data)
+            .sort()
+            .forEach((uid) => {
+              // Filter out empty or 'N' user IDs
+              if (uid && uid !== 'N' && uid !== "empty") {
+                const bal =
+                  parseFloat(data[uid]?.wallet?.balance) ||
+                  0; /* fallback 0 if missing */
+
+                const tr = document.createElement('tr');
+                const tdId = document.createElement('td');
+                tdId.textContent = uid;
+                const tdBal = document.createElement('td');
+                tdBal.textContent = bal.toFixed(2);
+
+                tr.append(tdId, tdBal);
+                body.appendChild(tr);
+              }
+            });
+        },
+        (err) => console.error('wallet read failed:', err)
+      );
+
+      /* ---------- Spot indicator helper ---------- */
+      function makeSpot(status, id, bookedId) { // Add bookedId parameter
+        const wrap = document.createElement('div');
+        wrap.className = 'parking-wrapper';
+
+        const dot = document.createElement('div');
+        dot.className = 'parking-spot'; // Base class
+
+        const lbl = document.createElement('div');
+        lbl.className = 'parking-label';
+
+        if (status === 1) { // Occupied
+          if (id === 'N/A') { // Check if ID is N/A
+            dot.classList.add('unknown-occupied');
+            dot.title = 'Occupied (Unknown ID)';
+            lbl.textContent = 'N/A';
+          } else {
+            dot.classList.add('occupied');
+            dot.title = `Occupied by ${id}`;
+            lbl.textContent = id;
+          }
+        } else if (status === 0) { // Vacant
+          dot.classList.add('vacant');
+          dot.title = 'Available';
+          lbl.textContent = ''; // No label for vacant
+        } else if (status === 2) { // Booked
+          dot.classList.add('booked');
+          dot.title = `Booked by ${bookedId}`; // Use bookedId for title
+          lbl.textContent = bookedId; // Display bookedId text
+        } else { // Default/Unknown status
+            dot.title = 'Unknown Status';
+            lbl.textContent = '?';
+        }
+
+        wrap.appendChild(dot);
+        wrap.appendChild(lbl);
+
+        return wrap;
+      }
+
+      /* ---------- Parking‑row listener ---------- */
+      onValue(
+        rootRef,
+        (snap) => {
+          const data = snap.val() || {};
+          document.getElementById('rowData').textContent =
+            'Raw Data: ' + JSON.stringify(data);
+
+          const body = document.getElementById('parkingTableBody');
+          body.innerHTML = '';
+
+          // Sort rows alphabetically for consistent order
+          Object.keys(data)
+            .filter(key => key.toLowerCase().startsWith('row'))
+            .sort() // Sort row keys
+            .forEach(key => {
+              const rowObj = data[key];
+              const tr = document.createElement('tr');
+
+              // Row label
+              const tdLabel = document.createElement('td');
+              tdLabel.textContent = key;
+              tr.appendChild(tdLabel);
+
+              // Spots cell
+              const tdSpots = document.createElement('td');
+              for (let i = 1; i <= 6; i++) { // Assuming max 6 slots per row
+                const slotKey = 'slot' + i;
+                const slot = rowObj[slotKey] || {};
+                const status = Number(slot.status || 0); // Default to 0 (vacant) if missing
+                const id = slot.id || ''; // ID for occupied status
+                const bookedId = slot.booked || ''; // ID for booked status
+
+                // Pass both id and bookedId to makeSpot
+                tdSpots.appendChild(makeSpot(status, id, bookedId));
+              }
+              tr.appendChild(tdSpots);
+
+              body.appendChild(tr);
+            });
+        },
+        (err) => console.error('row read failed:', err)
+      );
+    </script>
+  </body>
+</html>

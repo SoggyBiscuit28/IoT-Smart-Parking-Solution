@@ -1,0 +1,497 @@
+ESP32 #1
+
+/********************************************************************
+ *  row1.ino  –  Smart‑parking "row‑1" ESP32 node (updated with server state)
+ ********************************************************************/
+#include <FirebaseESP32.h>
+#include <WiFi.h>
+
+/* ─── Wi‑Fi & Firebase ───────────────────────────────────────────*/
+#define WIFI_SSID   "Biscuit"
+#define WIFI_PASS   "peepeepoopoocheck"
+#define DB_URL      \
+  "https://smart-parking-testing-874a2-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DB_API_KEY  "AIzaSyCAaehjdrBkuXuvp1DZZhd32YV3RzAShy8"
+
+/* ─── Hardware map ───────────────────────────────────────────────*/
+#define ir1           16
+#define ir2           17
+#define button1        5
+#define button2       18
+#define capa1         32
+#define capa2         33
+#define led1          12
+#define led2          14
+#define led3          21
+#define led4          26
+#define led5          19
+#define led6          25
+#define TRIG_PIN       4
+#define ECHO_PIN      15
+#define RELAY_PIN     23
+
+/* thresholds */
+#define CAPA_THRESHOLD       50
+#define DIST_THRESHOLD_CM    13
+#define DIST_TIMEOUT       30000   // µs
+#define BLINK_INTERVAL       300    // ms
+#define BLINK_TIMEOUT     15000    // ms (10 seconds max blinking time)
+
+/* ultrasonic polling interval */
+#define DIST_POLL_INTERVAL_MS 60   // ≥60 ms between pings
+
+/* ─── Globals ────────────────────────────────────────────────────*/
+FirebaseData   fbdo;
+FirebaseAuth   auth;
+FirebaseConfig cfg;
+
+const int N = 6;
+int  state[N], prev[N], serverState[N];
+String idTag[N];
+uint8_t ledPins[N] = { led1, led2, led3, led4, led5, led6 };
+const float slotWeight[N] = { 6, 5, 4, 3, 2, 1 };
+
+/* Blinking variables */
+bool isBlinking = false;
+int currentBlinkIndex = -1;
+bool ledBlinkState = false;
+unsigned long lastBlinkTime = 0;
+unsigned long blinkStartTime = 0;
+int oldArr[N]; // For blinking logic
+int oldServerArr[N]; // For tracking server state changes
+
+/* command polling */
+unsigned long lastCmdTs     = 0;
+unsigned long lastEntryTs   = 0;  // Timestamp of the latest entry command
+String        lastCmdId     = "";
+String        lastEntryId   = "";  // ID of the latest entry command
+String        lastCmdAction = "";
+unsigned long lastCmdPoll   = 0;
+const unsigned long CMD_POLL_INTERVAL = 200;
+
+/* server polling */
+unsigned long lastServerPoll = 0;
+const unsigned long SERVER_POLL_INTERVAL = 1000; // Poll server data every second
+
+/* relay */
+bool        relayOn  = false;
+unsigned long relayT0   = 0;
+unsigned long relaySpan = 0;
+
+/* ─── Helpers ────────────────────────────────────────────────────*/
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(400);
+  }
+  Serial.println("\nConnected – IP " + WiFi.localIP().toString());
+}
+
+void initFirebase() {
+  cfg.database_url               = DB_URL;
+  cfg.signer.tokens.legacy_token = DB_API_KEY;
+  Firebase.begin(&cfg, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long us = pulseIn(ECHO_PIN, HIGH, DIST_TIMEOUT);
+  if (us == 0) return 999;
+  return us * 0.0343f / 2.0f;
+}
+
+void ledmoment() {
+  // Update LED outputs according to state[] and serverState[]
+  for (int i = 0; i < N; i++){
+    if (isBlinking && i == currentBlinkIndex)
+      continue;
+      
+    // Priority: serverState = 2 > state = 1 > state/serverState = 0
+    if (serverState[i] == 2) {
+      digitalWrite(ledPins[i], HIGH); // Server state 2 forces LED ON
+    } else {
+      digitalWrite(ledPins[i], state[i] ? HIGH : LOW); // Otherwise use local state
+    }
+  }
+}
+
+// Find the best available slot for blinking recommendation
+int blinkingIndex() {
+  int idx = -1;
+  float best = -1;
+  
+  // Count reserved and occupied slots
+  int unavailableCount = 0;
+  for (int i = 0; i < N; ++i) {
+    if (state[i] == 1 || serverState[i] == 2) {
+      unavailableCount++;
+    }
+  }
+  
+  // If all slots are taken, return -1 (no blinking)
+  if (unavailableCount >= N) {
+    return -1;
+  }
+  
+  // Otherwise find the best available slot
+  for (int i = 0; i < N; ++i) {
+    // Only consider slots that are both physically empty (state = 0) 
+    // and not reserved (serverState != 2)
+    if (state[i] == 0 && serverState[i] != 2 && slotWeight[i] > best) {
+      best = slotWeight[i];
+      idx = i;
+    }
+  }
+  
+  return idx;
+}
+
+void pushRow() {
+  FirebaseJson row;
+  for (int i = 0; i < N; ++i) {
+    if(idTag[i]=="empty" || idTag[i]=="N/A"){
+      FirebaseJson user;
+      user.set("place","none");
+      Firebase.updateNode(fbdo, "/users/"+idTag[i],user);
+      FirebaseJson s;
+      int statusToSend = (serverState[i] == 2) ? 2 : state[i];
+      s.set("status", statusToSend);
+      s.set("id", idTag[i]);
+      row.set("slot" + String(i+1), s);
+    }
+    FirebaseJson s;
+    FirebaseJson user;
+    user.set("place","row1/slot"+String(i+1));
+    // Only use local state if server state is not 2
+    // If server state is 2, preserve it instead of overwriting with local state
+    int statusToSend = state[i];
+    s.set("status", statusToSend);
+    s.set("id", idTag[i]);
+    row.set("slot" + String(i+1), s);
+    Firebase.updateNode(fbdo, "/users/"+idTag[i],user);
+  }
+  
+  if (!Firebase.updateNode(fbdo, "/row1", row)) {
+    Serial.println("FB error: " + fbdo.errorReason());
+  }
+  
+}
+
+void pollServerState() {
+  if (millis() - lastServerPoll < SERVER_POLL_INTERVAL) return;
+  lastServerPoll = millis();
+  
+  if (!Firebase.getJSON(fbdo, "/row1")) {
+    Serial.println("Server poll error: " + fbdo.errorReason());
+    return;
+  }
+  
+  FirebaseJson *row = fbdo.jsonObjectPtr();
+  FirebaseJsonData result;
+  
+  bool serverStateChanged = false;
+  
+  // Save the current server state for comparison
+  for (int i = 0; i < N; i++) {
+    oldServerArr[i] = serverState[i];
+  }
+  
+  for (int i = 0; i < N; i++) {
+    String path = "slot" + String(i+1) + "/status";
+    row->get(result, path);
+    
+    if (result.success) {
+      int newState = result.to<int>();
+      if (serverState[i] != newState) {
+        serverState[i] = newState;
+        serverStateChanged = true;
+        Serial.printf("Server state for slot %d changed to %d\n", i, newState);
+        
+        // If a slot changed to state 2 and it's currently blinking, stop blinking
+        if (newState == 2 && isBlinking && currentBlinkIndex == i) {
+          Serial.println("Stopping blinking - slot now reserved");
+          stopBlinking();
+        }
+      }
+    }
+  }
+  
+  if (serverStateChanged) {
+    ledmoment(); // Update LEDs immediately if server state changed
+  }
+}
+
+// Check if an ID is already assigned to any slot
+bool isIdAlreadyAssigned(String id) {
+  if (id == "empty" || id == "N/A" || id.isEmpty()) {
+    return false;  // Special cases that can be in multiple slots
+  }
+  
+  for (int i = 0; i < N; ++i) {
+    if (idTag[i] == id) {
+      return true;  // ID already exists in a slot
+    }
+  }
+  return false;  // ID not found in any slot
+}
+
+void handleCommandsPoll() {
+  if (millis() - lastCmdPoll < CMD_POLL_INTERVAL) return;
+  lastCmdPoll = millis();
+
+  if (!Firebase.getJSON(fbdo, "/commands/esp32")) {
+    Serial.println("CMD poll: " + fbdo.errorReason());
+    return;
+  }
+  FirebaseJson *j = fbdo.jsonObjectPtr();
+  FirebaseJsonData r;
+
+  j->get(r, "timestamp");
+  unsigned long ts = r.to<unsigned long>();
+  if (ts == lastCmdTs) return;
+  
+  j->get(r, "id");     lastCmdId     = r.to<String>();
+  j->get(r, "action"); lastCmdAction = r.to<String>();
+  
+  // Store the latest entry command ID and timestamp
+  if (lastCmdAction == "entry") {
+    lastEntryId = lastCmdId;
+    lastEntryTs = ts;
+    Serial.printf("⇢ New entry ID stored: %s at ts=%lu\n", lastEntryId.c_str(), lastEntryTs);
+  }
+  
+  lastCmdTs = ts;
+
+  Serial.printf("⇢ CMD id=%s act=%s ts=%lu\n",
+                lastCmdId.c_str(), lastCmdAction.c_str(), ts);
+
+  digitalWrite(RELAY_PIN, HIGH);
+  relayT0   = millis();
+  relaySpan = (lastCmdAction == "entry") ? 1000 : 3000;
+  relayOn   = true;
+}
+
+void updateRelay() {
+  if (relayOn && millis() - relayT0 >= relaySpan) {
+    digitalWrite(RELAY_PIN, LOW);
+    relayOn = false;
+    Serial.println("Relay OFF");
+  }
+}
+
+void stopBlinking() {
+  if (isBlinking && currentBlinkIndex >= 0 && currentBlinkIndex < N) {
+    digitalWrite(ledPins[currentBlinkIndex], LOW);
+    isBlinking = false;
+    currentBlinkIndex = -1;
+    Serial.println("Blinking stopped");
+  }
+}
+
+/* ─── setup ──────────────────────────────────────────────────────*/
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(ir1, INPUT); pinMode(ir2, INPUT);
+  pinMode(button1, INPUT); pinMode(button2, INPUT);
+  pinMode(capa1, INPUT);  pinMode(capa2, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT_PULLDOWN);
+
+  for (uint8_t p : ledPins) pinMode(p, OUTPUT);
+  for (int i = 0; i < N; ++i) {
+    state[i] = prev[i] = serverState[i] = oldServerArr[i] = 0;
+    idTag[i] = "empty";
+    oldArr[i] = 0;
+  }
+
+  connectWiFi();
+  initFirebase();
+}
+
+/* ─── main loop ──────────────────────────────────────────────────*/
+void loop() {
+  // 1) Read sensors
+  state[0] = (digitalRead(ir1)     == LOW) ? 1 : 0;
+  state[1] = (digitalRead(ir2)     == LOW) ? 1 : 0;
+  state[2] = (digitalRead(button1) == LOW) ? 1 : 0;
+  state[3] = (digitalRead(button2) == LOW) ? 1 : 0;
+  state[4] = (touchRead(capa1) < CAPA_THRESHOLD) ? 1 : 0;
+  state[5] = (touchRead(capa2) < CAPA_THRESHOLD) ? 1 : 0;
+  int a = touchRead(capa1);
+  int b = touchRead(capa2);
+  Serial.print("capa1 and capa2: ");
+  Serial.print(a);
+  Serial.print(" ");
+  Serial.println(b);
+  // 2) Poll server for state updates
+  pollServerState();
+
+  // 3) Ultrasonic distance measurement
+  float distance = getDistance();
+  
+  // 4) Blinking logic: if distance is below threshold, select a LED to blink
+  if (!isBlinking && (distance < DIST_THRESHOLD_CM)) {
+    int bIndex = blinkingIndex();
+    if (bIndex != -1) {
+      isBlinking = true;
+      currentBlinkIndex = bIndex;
+      ledBlinkState = false; // start with LED off
+      lastBlinkTime = millis();
+      blinkStartTime = millis(); // Start timing the blink duration
+      
+      // Take a snapshot of current state for blinking logic
+      for (int i = 0; i < N; i++){
+        oldArr[i] = state[i];
+      }
+      
+      Serial.printf("Started blinking slot %d\n", bIndex);
+    } else {
+      Serial.println("No available slot to blink");
+    }
+  }
+  
+  // 5) Check to stop blinking:
+  // - If the blinking slot becomes occupied (1) or reserved (2)
+  // - OR if any sensor changes from low to high
+  // - OR if it's been blinking for more than 10 seconds
+  if (isBlinking) {
+    bool stopBlink = false;
+    
+    // Only check the status of the currently blinking slot
+    if (currentBlinkIndex >= 0 && currentBlinkIndex < N) {
+      // Check if current blinking slot becomes occupied or reserved
+      if (oldArr[currentBlinkIndex] == 0 && 
+         (state[currentBlinkIndex] == 1 || serverState[currentBlinkIndex] == 2)) {
+        stopBlink = true;
+        Serial.println("Stopping blink - slot occupied or reserved");
+      }
+    }
+    
+    // Check if any sensor changes from low to high (0 to 1)
+    for (int i = 0; i < N; ++i) {
+      if (oldArr[i] == 0 && state[i] == 1) {
+        stopBlink = true;
+        Serial.printf("Stopping blink - sensor %d changed from low to high\n", i);
+        break;
+      }
+    }
+    
+    // Check if blinking timeout reached (10 seconds)
+    if (millis() - blinkStartTime >= BLINK_TIMEOUT) {
+      stopBlink = true;
+      Serial.println("Stopping blink - timeout reached");
+    }
+    
+    if (stopBlink) {
+      stopBlinking();
+    }
+  }
+  
+  // Update oldArr with current state after all checks if not blinking
+  if (!isBlinking) {
+    for (int i = 0; i < N; i++) {
+      oldArr[i] = state[i];
+    }
+  }
+  
+  // 6) Handle blinking LED if blinking is active
+  if (isBlinking && currentBlinkIndex >= 0 && currentBlinkIndex < N) {
+    unsigned long now = millis();
+    if ((now - lastBlinkTime) >= BLINK_INTERVAL) {
+      lastBlinkTime = now;
+      ledBlinkState = !ledBlinkState;
+      digitalWrite(ledPins[currentBlinkIndex], ledBlinkState ? HIGH : LOW);
+    }
+  }
+  
+  // 7) Update non-blinking LEDs
+  ledmoment();
+
+  // 8) Tag IDs on entry/exit - UPDATED LOGIC FOR RESERVED SLOTS (SERVER STATE 2)
+  for (int i = 0; i < N; ++i) {
+    // Handle regular slots (server state 0 or 1)
+    if (serverState[i] != 2) {
+      // When a slot changes from empty to occupied
+      if (prev[i] == 0 && state[i] == 1) {
+        // If we have a stored entry ID and it's not already assigned to another slot
+        if (!lastEntryId.isEmpty() && !isIdAlreadyAssigned(lastEntryId)) {
+          idTag[i] = lastEntryId;
+          Serial.printf("Slot %d occupied with ID: %s\n", i, lastEntryId.c_str());
+        } else {
+          // ID is already in use or not available
+          idTag[i] = "N/A";
+          Serial.printf("Slot %d occupied but using 'N/A' as ID %s is already assigned elsewhere\n", 
+                        i, lastEntryId.c_str());
+        }
+      }
+      // When a slot becomes empty
+      if (prev[i] == 1 && state[i] == 0) {
+        idTag[i] = "empty";
+        Serial.printf("Slot %d now empty\n", i);
+      }
+    }
+    // Handle reserved slots (server state 2)
+    else {
+      // When a reserved slot changes from empty to occupied
+      if (prev[i] == 0 && state[i] == 1) {
+        // If we have a stored entry ID and it's not already assigned to another slot
+        if (!lastEntryId.isEmpty() && !isIdAlreadyAssigned(lastEntryId)) {
+          idTag[i] = lastEntryId;
+          Serial.printf("Reserved slot %d occupied with ID: %s\n", i, lastEntryId.c_str());
+        } else {
+          // ID is already in use or not available
+          idTag[i] = "N/A";
+          Serial.printf("Reserved slot %d occupied but using 'N/A' as ID %s is already assigned elsewhere\n", 
+                        i, lastEntryId.c_str());
+        }
+      }
+      // When a reserved slot becomes empty
+      if (prev[i] == 1 && state[i] == 0) {
+        idTag[i] = "empty";
+        Serial.printf("Reserved slot %d now empty\n", i);
+      }
+    }
+    // If state doesn't change, we preserve the existing ID
+  }
+
+  // 9) Push changes to Firebase if any slot changed
+  bool diff = false;
+  for (int i = 0; i < N; ++i) {
+    if (state[i] != prev[i]) { diff = true; break; }
+  }
+  if (diff) {
+    pushRow();
+    memcpy(prev, state, sizeof(state));
+  }
+
+  // 10) Commands + relay
+  handleCommandsPoll();
+  updateRelay();
+
+  // 11) Debug output
+  Serial.print("Dist: "); Serial.print((int)distance);
+  Serial.print(" cm  Slots:");
+  for (int i = 0; i < N; ++i) {
+    Serial.print(" ["); Serial.print(state[i]);
+    Serial.print("/"); Serial.print(serverState[i]); // Add server state to debug output
+    Serial.print(" "); Serial.print(idTag[i]); Serial.print("]");
+  }
+  Serial.println();
+  Serial.print("Latest Entry ID: "); Serial.println(lastEntryId);
+  Serial.print("Blink Index: "); Serial.println(currentBlinkIndex);
+  if (isBlinking) {
+    Serial.print("Blinking for: ");
+    Serial.print((millis() - blinkStartTime) / 1000);
+    Serial.println(" seconds");
+  }
+
+  delay(500);  // small delay to avoid runaway loop
+}

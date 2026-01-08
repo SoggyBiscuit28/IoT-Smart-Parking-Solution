@@ -1,0 +1,369 @@
+ESP32 #2
+
+/********************************************************************
+ *  cmd_listener.ino  –  watches /commands/esp32/timestamp,
+ *                       writes a fresh OTP for entry/exit,
+ *                       displays OTPs on LCD, sends UART commands,
+ *                       and displays row with most empty slots.
+ ********************************************************************/
+#include <WiFi.h>
+#include <FirebaseESP32.h>       // by mobizt, v4.x
+#include <LiquidCrystal.h>       // For LCD communication
+#include <HardwareSerial.h>      // Add this for HardwareSerial
+
+/* ─── Wi‑Fi & Firebase ───────────────────────────────────────────*/
+#define WIFI_SSID   "Biscuit"
+#define WIFI_PASS   "peepeepoopoocheck"
+
+#define DB_URL      "https://smart-parking-testing-874a2-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DB_API_KEY  "AIzaSyCAaehjdrBkuXuvp1DZZhd32YV3RzAShy8"
+
+/* ─── Hardware ──────────────────────────────────────────────────*/
+// UART Communication
+#define UART_TX     17            // GPIO pin for UART TX
+#define UART_RX     16            // GPIO pin for UART RX
+#define UART_BAUD   115200        // Baud rate for UART
+
+// LCD Pins
+#define LCD_RS_PIN  18
+#define LCD_EN_PIN  19
+#define LCD_D4_PIN   5
+#define LCD_D5_PIN   4
+#define LCD_D6_PIN  15
+#define LCD_D7_PIN  27
+
+/* ─── Parking Configuration ──────────────────────────────────────*/
+#define NUM_ROWS    2             // Number of parking rows
+#define SLOTS_PER_ROW 6           // Slots per row
+#define SLOT_CHECK_INTERVAL 10000 // Check slots every 10 seconds
+#define LCD_ROW_DISPLAY_TIME 2000 // ms to show row info
+
+/* ─── Globals ───────────────────────────────────────────────────*/
+FirebaseData   fbdo;
+FirebaseAuth   auth;
+FirebaseConfig cfg;
+LiquidCrystal  lcd(LCD_RS_PIN, LCD_EN_PIN, LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN);
+HardwareSerial SerialGate(2);     // Define SerialGate using HardwareSerial(2) for Serial2
+
+String lastTimestamp = "";
+unsigned long lastPoll = 0;
+unsigned long lastSlotCheck = 0;
+unsigned long rowDisplayStart = 0;
+bool showingRowInfo = false;
+int maxEmptyRow = 0;
+int maxEmptyCount = 0;
+const unsigned long POLL_MS = 200; // 5 Hz for commands
+uint16_t currentEntryOtp = 0;
+uint16_t currentExitOtp = 0;
+
+/* ─── Helpers ───────────────────────────────────────────────────*/
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi");
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  uint8_t dots = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    lcd.setCursor(dots % 16, 1);
+    lcd.print(".");
+    dots++;
+    delay(350);
+  }
+  Serial.println("\nConnected  →  IP " + WiFi.localIP().toString());
+  lcd.clear();
+  lcd.print("WiFi Connected!");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+}
+
+/* ─── Firebase Initialization ────────────────────────────────────*/
+void initFirebase() {
+  cfg.database_url = DB_URL;
+  cfg.signer.tokens.legacy_token = DB_API_KEY;
+  Firebase.begin(&cfg, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+inline uint16_t newOtp() { return 1000 + esp_random() % 9000; }
+
+void triggerGate() {
+  // Send gate open command via UART with improved error handling
+  Serial.println("Sending OPEN_GATE command to Servo ESP32");
+  SerialGate.println("OPEN_GATE");
+  SerialGate.flush(); // Ensure data is transmitted
+  
+  // Wait for and report any response (optional)
+  unsigned long startTime = millis();
+  String response = "";
+  bool responseReceived = false;
+  
+  // Wait up to 2 seconds for a response
+  while (millis() - startTime < 2000) {
+    if (SerialGate.available()) {
+      char c = SerialGate.read();
+      if (c == '\n') {
+        responseReceived = true;
+        break;
+      }
+      response += c;
+    }
+    delay(10);
+  }
+  
+  if (responseReceived) {
+    Serial.println("Received response from Servo ESP32: " + response);
+  } else {
+    Serial.println("No response received from Servo ESP32");
+  }
+}
+
+void updateLcdDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Entry OTP: ");
+  if (currentEntryOtp == 0) {
+    lcd.print("----");
+  } else {
+    char otpStr[5];
+    sprintf(otpStr, "%04d", currentEntryOtp);
+    lcd.print(otpStr);
+  }
+  lcd.setCursor(0, 1);
+  lcd.print("Exit OTP:  ");
+  if (currentExitOtp == 0) {
+    lcd.print("----");
+  } else {
+    char otpStr[5];
+    sprintf(otpStr, "%04d", currentExitOtp);
+    lcd.print(otpStr);
+  }
+}
+
+void displayRowInfo() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Go To: Row ");
+  lcd.print(maxEmptyRow);
+  lcd.setCursor(0, 1);
+  lcd.print(maxEmptyCount);
+  lcd.print(" empty slots");
+}
+
+/* ─── Updated Function: Count Empty Slots ────────────────────────*/
+void checkEmptySlots() {
+  int emptyCounts[NUM_ROWS] = {0}; // Array to store empty slot counts per row
+  int maxEmpty = -1;              // Track max empty slots
+  int maxRow = 0;                 // Track row with max empty slots
+
+  Serial.println(F("\n=== Checking Parking Slots ==="));
+  for (int row = 1; row <= NUM_ROWS; row++) {
+    String rowPath = "/row" + String(row);
+    int emptySlots = 0;
+
+    for (int slot = 1; slot <= SLOTS_PER_ROW; slot++) {
+      String slotPath = rowPath + "/slot" + String(slot) + "/status";
+      if (Firebase.getInt(fbdo, slotPath)) {
+        int status = fbdo.to<int>();
+        if (status == 0) {
+          emptySlots++;
+        }
+      } else {
+        Serial.println("Error reading " + slotPath + ": " + fbdo.errorReason());
+      }
+    }
+
+    emptyCounts[row - 1] = emptySlots;
+    Serial.printf("Row %d: %d empty slots\n", row, emptySlots);
+
+    if (emptySlots > maxEmpty) {
+      maxEmpty = emptySlots;
+      maxRow = row;
+    }
+  }
+
+  // Store results for display
+  maxEmptyRow = maxRow;
+  maxEmptyCount = maxEmpty;
+
+  Serial.printf("\nRow with most empty slots: Row %d (%d empty)\n", maxRow, maxEmpty);
+  Serial.println(F("============================="));
+}
+
+/* ─── Command Polling ───────────────────────────────────────────*/
+void ensureNetwork() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    lcd.clear();
+    lcd.print("WiFi Lost!");
+    connectWiFi();
+  }
+  if (!Firebase.ready()) {
+    Serial.println("Firebase disconnected, reconnecting...");
+    lcd.setCursor(0, 1);
+    lcd.print("FB Reconnect...");
+    Firebase.reconnectWiFi(true);
+    initFirebase();
+  }
+}
+
+bool pollCommand() {
+  ensureNetwork();
+  if (!Firebase.getString(fbdo, "/commands/esp32/timestamp")) {
+    Serial.println("poll → " + fbdo.errorReason());
+    return false;
+  }
+  String ts = fbdo.to<String>();
+  if (ts == lastTimestamp || ts.isEmpty()) return false;
+
+  lastTimestamp = ts;
+
+  if (!Firebase.get(fbdo, "/commands/esp32")) {
+    Serial.println("cmd → " + fbdo.errorReason());
+    return false;
+  }
+
+  FirebaseJson *json = fbdo.to<FirebaseJson *>();
+  if (!json) {
+    Serial.println("cmd → Failed to get JSON object");
+    return false;
+  }
+
+  FirebaseJsonData node;
+  String action, id;
+
+  if (json->get(node, "action") && node.success) {
+    action = node.to<String>();
+  } else {
+    Serial.println("cmd → Failed to parse 'action'");
+    return false;
+  }
+  if (json->get(node, "id") && node.success) {
+    id = node.to<String>();
+  } else {
+    Serial.println("cmd → Failed to parse 'id'");
+    return false;
+  }
+
+  uint16_t otp = newOtp();
+  String path;
+  bool dbSuccess = false;
+
+  if (action == "entry") {
+    path = "/otp/entry_otp";
+    if (Firebase.setInt(fbdo, path, otp)) {
+      Serial.printf("DB ✓ %s ← %u\n", path.c_str(), otp);
+      currentEntryOtp = otp;
+      dbSuccess = true;
+      // Trigger row info display before gate movement
+      checkEmptySlots();
+      showingRowInfo = true;
+      rowDisplayStart = millis();
+      displayRowInfo();
+      triggerGate(); // Send command to second ESP32 to operate the gate
+    } else {
+      Serial.println("DB ✗ (Entry) → " + fbdo.errorReason());
+    }
+  } else if (action == "exit") {
+    path = "/otp/exit_otp";
+    if (Firebase.setInt(fbdo, path, otp)) {
+      Serial.printf("-DB ✓ %s ← %u\n", path.c_str(), otp);
+      currentExitOtp = otp;
+      dbSuccess = true;
+      updateLcdDisplay();
+      triggerGate(); // Send command to second ESP32 to operate the gate
+    } else {
+      Serial.println("DB ✗ (Exit) → " + fbdo.errorReason());
+    }
+  } else {
+    Serial.println("Unknown action: " + action);
+    return false;
+  }
+
+  if (!dbSuccess) {
+    return false;
+  }
+
+  Serial.println(F("\n──────────────────────────────────────────"));
+  Serial.printf("New CMD ▸ timestamp: %s\n", lastTimestamp.c_str());
+  Serial.printf("         ▸ action   : %s\n", action.c_str());
+  Serial.printf("         ▸ id       : %s\n", id.c_str());
+  Serial.printf("         ▸ otp (%s): %u\n", action.c_str(), otp);
+  Serial.println(F("──────────────────────────────────────────"));
+
+  return true;
+}
+
+void readInitialOtps() {
+  if (Firebase.getInt(fbdo, "/otp/entry_otp")) {
+    currentEntryOtp = fbdo.to<int>();
+    Serial.printf("Initial Entry OTP: %u\n", currentEntryOtp);
+  } else {
+    Serial.println("Failed to read entry_otp: " + fbdo.errorReason());
+  }
+  if (Firebase.getInt(fbdo, "/otp/exit_otp")) {
+    currentExitOtp = fbdo.to<int>();
+    Serial.printf("Initial Exit OTP: %u\n", currentExitOtp);
+  } else {
+    Serial.println("Failed to read exit_otp: " + fbdo.errorReason());
+  }
+  updateLcdDisplay();
+}
+
+/* ─── Arduino setup / loop ──────────────────────────────────────*/
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+  
+  // Initialize UART for communicating with the servo controller ESP32
+  SerialGate.begin(UART_BAUD, SERIAL_8N1, UART_TX, UART_RX);
+  
+  lcd.begin(16, 2);
+  lcd.print("System Booting..");
+  delay(1000);
+
+  connectWiFi();
+  initFirebase();
+  readInitialOtps();
+
+  randomSeed(esp_random());
+
+  updateLcdDisplay();
+  Serial.println("Setup complete. Waiting for commands...");
+  
+  // Send a test message to the servo controller
+  SerialGate.println("MAIN_ESP32_READY");
+  Serial.println("Sent initialization message to Servo ESP32");
+}
+
+void loop() {
+  if (millis() - lastPoll >= POLL_MS) {
+    lastPoll = millis();
+    pollCommand();
+  }
+
+  // Periodically check empty slots
+  if (millis() - lastSlotCheck >= SLOT_CHECK_INTERVAL) {
+    lastSlotCheck = millis();
+    if (!showingRowInfo) {
+      checkEmptySlots();
+    }
+  }
+
+  // Check if row info display time has elapsed
+  if (showingRowInfo && millis() - rowDisplayStart >= LCD_ROW_DISPLAY_TIME) {
+    showingRowInfo = false;
+    updateLcdDisplay();
+  }
+
+  // Check for any incoming messages from the servo controller
+  while (SerialGate.available()) {
+    String message = SerialGate.readStringUntil('\n');
+    message.trim();
+    if (message.length() > 0) {
+      Serial.println("Message from Servo ESP32: " + message);
+    }
+  }
+
+  delay(10);
+}

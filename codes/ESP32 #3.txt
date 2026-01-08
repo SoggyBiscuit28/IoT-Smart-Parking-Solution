@@ -1,0 +1,223 @@
+ESP32 #3
+
+/********************************************************************
+ *  servo_controller.ino  –  Receives UART commands from primary ESP32
+ *                          Controls servo motor for gate operation
+ ********************************************************************/
+#include <ESP32Servo.h>
+
+/* ─── Hardware Configuration ───────────────────────────────────────*/
+#define SERVO_PIN      12        // SG‑90 signal wire -> GPIO 12
+#define SERVO_OPEN     90        // degrees - gate open position
+#define SERVO_HOME     0         // degrees - gate closed position
+#define GATE_OPEN_TIME 3000      // ms gate stays open (5 seconds)
+#define SERVO_TEST_DELAY 100    // ms between servo test movements
+
+/* ─── UART Configuration ────────────────────────────────────────────*/
+#define UART_RX      16          // GPIO pin for UART RX (connect to TX of primary ESP32)
+#define UART_TX      17          // GPIO pin for UART TX (connect to RX of primary ESP32)
+#define UART_BAUD    115200      // Baud rate for UART
+
+/* ─── Globals ───────────────────────────────────────────────────────*/
+Servo gate;
+String receivedData = "";
+bool dataComplete = false;
+bool gateOpening = false;
+unsigned long gateOpenTime = 0;
+bool servoAttached = false;
+
+void setup() {
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+  delay(1000); // Longer delay for serial to initialize properly
+  
+  Serial.println("\n\n");
+  Serial.println("========================================");
+  Serial.println("Servo Controller ESP32 Starting...");
+  
+  // Initialize UART2 for communication with primary ESP32
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+  Serial.println("UART initialized on pins RX:" + String(UART_RX) + ", TX:" + String(UART_TX));
+  
+  // Initialize servo with more robust error handling
+  Serial.println("Initializing servo on pin " + String(SERVO_PIN) + "...");
+  
+  // Explicitly detach first in case it was previously attached
+  gate.detach();
+  
+  // Set PWM frequency before attaching
+  gate.setPeriodHertz(50);
+  
+  // Try to attach the servo
+  gate.attach(SERVO_PIN);
+  delay(500); // Give the servo time to initialize
+  
+  if (gate.attached()) {
+    servoAttached = true;
+    Serial.println("Servo successfully attached");
+    
+    // Move to home position
+    gate.write(SERVO_HOME);
+    Serial.println("Servo initialized to home position: " + String(SERVO_HOME) + " degrees");
+    delay(500); // Give servo time to reach position
+    
+    // Perform a quick test move to verify servo operation
+    Serial.println("Performing servo test movement...");
+    delay(SERVO_TEST_DELAY);
+    gate.write(45); // Move halfway
+    Serial.println("  - Moving to 45 degrees");
+    delay(SERVO_TEST_DELAY);
+    gate.write(SERVO_HOME); // Return home
+    Serial.println("  - Returning to home position");
+    delay(500); // Additional delay for stability
+  } else {
+    Serial.println("ERROR: Failed to attach servo! Check wiring and power.");
+  }
+  
+  Serial.println("Servo Controller Ready. Waiting for commands...");
+  Serial.println("========================================");
+  
+  // Send acknowledgment to primary ESP32
+  Serial2.println("SERVO_READY");
+}
+
+void loop() {
+  // Check for incoming UART data
+  while (Serial2.available()) {
+    char inChar = (char)Serial2.read();
+    Serial.print(inChar); // Echo received characters for debugging
+    
+    // Process commands line by line
+    if (inChar == '\n') {
+      dataComplete = true;
+    } else {
+      receivedData += inChar;
+    }
+  }
+  
+  // Process complete command
+  if (dataComplete) {
+    Serial.print("Received command: '");
+    Serial.print(receivedData);
+    Serial.println("'");
+    
+    // Trim whitespace
+    receivedData.trim();
+    
+    if (receivedData == "OPEN_GATE") {
+      Serial.println(">>> Opening gate command received <<<");
+      
+      if (servoAttached && gate.attached()) {
+        openGate();
+        // Send confirmation back to primary ESP32
+        Serial2.println("GATE_OPENED");
+      } else {
+        Serial.println("ERROR: Cannot open gate - servo not attached");
+        // Try to reattach servo
+        Serial.println("Attempting to reattach servo...");
+        gate.detach();  // Explicitly detach first
+        delay(500);     // Small delay before reattaching
+        
+        gate.setPeriodHertz(50);  // Reset PWM frequency
+        gate.attach(SERVO_PIN);
+        delay(500);     // Give the servo time to initialize
+        
+        if (gate.attached()) {
+          servoAttached = true;
+          Serial.println("Servo reattached successfully");
+          openGate();
+          // Send confirmation back to primary ESP32
+          Serial2.println("GATE_OPENED");
+        } else {
+          Serial.println("ERROR: Failed to reattach servo");
+          // Send error message back to primary ESP32
+          Serial2.println("SERVO_ERROR");
+        }
+      }
+    }
+    
+    // Clear the command buffer
+    receivedData = "";
+    dataComplete = false;
+  }
+  
+  // Check if it's time to close the gate
+  if (gateOpening && (millis() - gateOpenTime >= GATE_OPEN_TIME)) {
+    closeGate();
+    gateOpening = false;
+    // Send confirmation back to primary ESP32
+    Serial2.println("GATE_CLOSED");
+  }
+  
+  delay(10);
+}
+
+void openGate() {
+  Serial.println("SERVO: Moving to OPEN position: " + String(SERVO_OPEN) + " degrees");
+  
+  // Check if servo is still attached before trying to read position
+  if (!gate.attached()) {
+    Serial.println("ERROR: Servo detached. Trying to reattach...");
+    gate.detach();
+    gate.attach(SERVO_PIN);
+    delay(500);
+    
+    if (!gate.attached()) {
+      Serial.println("ERROR: Failed to reattach servo in openGate()");
+      Serial2.println("SERVO_ERROR");
+      return;
+    }
+  }
+  
+  // Move servo in smaller steps to see if it helps
+  int currentPos = gate.read();
+  Serial.println("Current position: " + String(currentPos));
+  
+  // Step gradually from current position to open position
+  const int STEP_SIZE = 5; // Smaller steps for smoother movement
+  for (int pos = currentPos; pos <= SERVO_OPEN; pos += STEP_SIZE) {
+    gate.write(pos);
+    Serial.println("Moving to position: " + String(pos));
+    delay(10); // Slightly longer delay between steps
+  }
+  
+  // Final move to exact position
+  gate.write(SERVO_OPEN);
+  delay(250); // Give servo time to reach final position
+  
+  gateOpening = true;
+  gateOpenTime = millis();
+  Serial.println("Gate opened to " + String(SERVO_OPEN) + " degrees");
+}
+
+void closeGate() {
+  Serial.println("SERVO: Moving to HOME position: " + String(SERVO_HOME) + " degrees");
+  
+  // Check if servo is still attached
+  if (!gate.attached()) {
+    Serial.println("ERROR: Servo detached. Trying to reattach...");
+    gate.detach();
+    gate.attach(SERVO_PIN);
+    delay(500);
+    
+    if (!gate.attached()) {
+      Serial.println("ERROR: Failed to reattach servo in closeGate()");
+      Serial2.println("SERVO_ERROR");
+      return;
+    }
+  }
+  
+  // Step gradually from open position to home position
+  const int STEP_SIZE = 5; // Smaller steps for smoother movement
+  for (int pos = SERVO_OPEN; pos >= SERVO_HOME; pos -= STEP_SIZE) {
+    gate.write(pos);
+    Serial.println("Moving to position: " + String(pos));
+    delay(150); // Slightly longer delay between steps
+  }
+  
+  // Final move to exact position
+  gate.write(SERVO_HOME);
+  delay(250); // Give servo time to reach final position
+  
+  Serial.println("Gate closed to " + String(SERVO_HOME) + " degrees");
+}
